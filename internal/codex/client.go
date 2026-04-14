@@ -13,7 +13,10 @@ import (
 	"sync/atomic"
 )
 
-const turnStreamBufferSize = 32
+const (
+	turnStreamBufferSize   = 32
+	turnStreamPendingLimit = 256
+)
 
 var errClientClosed = errors.New("app-server client is closed")
 
@@ -21,6 +24,190 @@ type pendingApproval struct {
 	requestID     json.RawMessage
 	turnID        string
 	requestMethod string
+}
+
+type queuedTurnEvent struct {
+	event      TurnEvent
+	closeAfter bool
+}
+
+type turnStream struct {
+	logger *slog.Logger
+	turnID string
+	out    chan TurnEvent
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	pending []queuedTurnEvent
+	closed  bool
+}
+
+func newTurnStream(turnID string, logger *slog.Logger) *turnStream {
+	stream := &turnStream{
+		logger: logger,
+		turnID: turnID,
+		out:    make(chan TurnEvent, turnStreamBufferSize),
+	}
+	stream.cond = sync.NewCond(&stream.mu)
+	go stream.run()
+	return stream
+}
+
+func (s *turnStream) events() <-chan TurnEvent {
+	return s.out
+}
+
+func (s *turnStream) enqueue(event TurnEvent, closeAfter bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	if s.coalescePendingLocked(event, closeAfter) {
+		s.cond.Signal()
+		return
+	}
+	if len(s.pending) >= turnStreamPendingLimit && !s.makeRoomLocked(event) {
+		s.logger.Warn(
+			"turn stream backlog full; dropping non-critical event",
+			slog.String("turnId", s.turnID),
+			slog.String("eventType", string(event.Type)),
+		)
+		return
+	}
+
+	s.pending = append(s.pending, queuedTurnEvent{
+		event:      event,
+		closeAfter: closeAfter,
+	})
+	if closeAfter {
+		s.closed = true
+	}
+	s.cond.Signal()
+}
+
+func (s *turnStream) fail(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	s.pending = append(s.pending, queuedTurnEvent{
+		event: TurnEvent{
+			Type:       TurnEventTypeError,
+			StopReason: "error",
+			Message:    err.Error(),
+		},
+		closeAfter: true,
+	})
+	s.closed = true
+	s.cond.Signal()
+}
+
+func (s *turnStream) run() {
+	for {
+		s.mu.Lock()
+		for len(s.pending) == 0 {
+			s.cond.Wait()
+		}
+		next := s.pending[0]
+		s.pending = s.pending[1:]
+		s.mu.Unlock()
+
+		s.out <- next.event
+		if next.closeAfter {
+			close(s.out)
+			return
+		}
+	}
+}
+
+func (s *turnStream) coalescePendingLocked(event TurnEvent, closeAfter bool) bool {
+	if closeAfter || len(s.pending) == 0 {
+		return false
+	}
+
+	lastIdx := len(s.pending) - 1
+	last := &s.pending[lastIdx]
+	if last.closeAfter {
+		return false
+	}
+
+	switch event.Type {
+	case TurnEventTypeUpdate, TurnEventTypeAgentMessageDelta,
+		TurnEventTypeReasoningDelta, TurnEventTypeCommandExecutionDelta:
+		if !sameTurnDeltaStream(last.event, event) {
+			return false
+		}
+		last.event.Delta += event.Delta
+		return true
+	case TurnEventTypeTokenUsageUpdated, TurnEventTypeDiffUpdated, TurnEventTypePlanUpdated:
+		for i := len(s.pending) - 1; i >= 0; i-- {
+			if s.pending[i].closeAfter {
+				continue
+			}
+			if !sameReplaceableTurnEvent(s.pending[i].event, event) {
+				continue
+			}
+			s.pending[i].event = event
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func (s *turnStream) makeRoomLocked(event TurnEvent) bool {
+	if isCriticalTurnEvent(event.Type) {
+		if s.dropOldestDroppableLocked() {
+			return true
+		}
+		return true
+	}
+	return s.dropOldestDroppableLocked()
+}
+
+func (s *turnStream) dropOldestDroppableLocked() bool {
+	for i, pending := range s.pending {
+		if pending.closeAfter || isCriticalTurnEvent(pending.event.Type) {
+			continue
+		}
+		s.pending = append(s.pending[:i], s.pending[i+1:]...)
+		return true
+	}
+	return false
+}
+
+func sameTurnDeltaStream(left TurnEvent, right TurnEvent) bool {
+	return left.Type == right.Type &&
+		left.ItemID == right.ItemID &&
+		left.ItemType == right.ItemType
+}
+
+func sameReplaceableTurnEvent(left TurnEvent, right TurnEvent) bool {
+	return left.Type == right.Type &&
+		left.ItemID == right.ItemID &&
+		left.ItemType == right.ItemType
+}
+
+func isCriticalTurnEvent(eventType TurnEventType) bool {
+	switch eventType {
+	case TurnEventTypeStarted,
+		TurnEventTypeItemStarted,
+		TurnEventTypeItemCompleted,
+		TurnEventTypeCompleted,
+		TurnEventTypeError,
+		TurnEventTypeApprovalRequired,
+		TurnEventTypeReviewModeEntered,
+		TurnEventTypeReviewModeExited,
+		TurnEventTypeBackendError:
+		return true
+	default:
+		return false
+	}
 }
 
 // Client is a minimal JSON-RPC client for codex app-server.
@@ -34,7 +221,7 @@ type Client struct {
 	mu          sync.Mutex
 	pending     map[string]chan RPCMessage
 	approvals   map[string]pendingApproval
-	turnStreams map[string]chan TurnEvent
+	turnStreams map[string]*turnStream
 	queuedTurns map[string][]TurnEvent
 	closed      bool
 }
@@ -51,7 +238,7 @@ func NewClient(process *Process, logger *slog.Logger) *Client {
 		logger:      logger,
 		pending:     make(map[string]chan RPCMessage),
 		approvals:   make(map[string]pendingApproval),
-		turnStreams: make(map[string]chan TurnEvent),
+		turnStreams: make(map[string]*turnStream),
 		queuedTurns: make(map[string][]TurnEvent),
 	}
 
@@ -413,26 +600,18 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) registerTurnStream(turnID string) <-chan TurnEvent {
-	ch := make(chan TurnEvent, turnStreamBufferSize)
+	stream := newTurnStream(turnID, c.logger)
 
 	c.mu.Lock()
-	c.turnStreams[turnID] = ch
+	c.turnStreams[turnID] = stream
 	queued := c.queuedTurns[turnID]
 	delete(c.queuedTurns, turnID)
 	c.mu.Unlock()
 
 	for _, event := range queued {
-		if isTerminalTurnEvent(event.Type) {
-			ch <- event
-			c.mu.Lock()
-			delete(c.turnStreams, turnID)
-			c.mu.Unlock()
-			close(ch)
-			return ch
-		}
-		ch <- event
+		stream.enqueue(event, isTerminalTurnEvent(event.Type))
 	}
-	return ch
+	return stream.events()
 }
 
 func (c *Client) call(ctx context.Context, method string, params any, out any) error {
@@ -1342,7 +1521,7 @@ func summarizeCodexErrorInfo(raw json.RawMessage) string {
 
 func (c *Client) pushTurnEvent(turnID string, event TurnEvent, closeAfter bool) {
 	c.mu.Lock()
-	ch, ok := c.turnStreams[turnID]
+	stream, ok := c.turnStreams[turnID]
 	if !ok {
 		c.queuedTurns[turnID] = append(c.queuedTurns[turnID], event)
 		c.mu.Unlock()
@@ -1353,15 +1532,7 @@ func (c *Client) pushTurnEvent(turnID string, event TurnEvent, closeAfter bool) 
 	}
 	c.mu.Unlock()
 
-	select {
-	case ch <- event:
-	default:
-		c.logger.Warn("turn stream channel full; dropping event", slog.String("turnId", turnID))
-	}
-
-	if closeAfter {
-		close(ch)
-	}
+	stream.enqueue(event, closeAfter)
 }
 
 func (c *Client) writeServerErrorResponse(id json.RawMessage, code int, message string) {
@@ -1400,7 +1571,7 @@ func (c *Client) failAll(err error) {
 	approvals := c.approvals
 	c.pending = make(map[string]chan RPCMessage)
 	c.approvals = make(map[string]pendingApproval)
-	c.turnStreams = make(map[string]chan TurnEvent)
+	c.turnStreams = make(map[string]*turnStream)
 	c.queuedTurns = make(map[string][]TurnEvent)
 	c.mu.Unlock()
 
@@ -1413,16 +1584,8 @@ func (c *Client) failAll(err error) {
 		}
 		close(ch)
 	}
-	for _, ch := range streams {
-		select {
-		case ch <- TurnEvent{
-			Type:       TurnEventTypeError,
-			StopReason: "error",
-			Message:    err.Error(),
-		}:
-		default:
-		}
-		close(ch)
+	for _, stream := range streams {
+		stream.fail(err)
 	}
 
 	for approvalID := range approvals {

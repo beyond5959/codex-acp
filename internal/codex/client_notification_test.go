@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 func TestHandleNotification_FileChangePatchKindCompatibility(t *testing.T) {
@@ -38,7 +39,7 @@ func TestHandleNotification_FileChangePatchKindCompatibility(t *testing.T) {
 			client := &Client{
 				logger:      slog.New(slog.NewJSONHandler(io.Discard, nil)),
 				approvals:   make(map[string]pendingApproval),
-				turnStreams: make(map[string]chan TurnEvent),
+				turnStreams: make(map[string]*turnStream),
 				queuedTurns: make(map[string][]TurnEvent),
 			}
 
@@ -72,7 +73,7 @@ func TestHandleNotification_TurnCompletedIncludesErrorMessage(t *testing.T) {
 	client := &Client{
 		logger:      slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		approvals:   make(map[string]pendingApproval),
-		turnStreams: make(map[string]chan TurnEvent),
+		turnStreams: make(map[string]*turnStream),
 		queuedTurns: make(map[string][]TurnEvent),
 	}
 
@@ -106,7 +107,7 @@ func TestHandleNotification_ErrorNotificationRetrying(t *testing.T) {
 	client := &Client{
 		logger:      slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		approvals:   make(map[string]pendingApproval),
-		turnStreams: make(map[string]chan TurnEvent),
+		turnStreams: make(map[string]*turnStream),
 		queuedTurns: make(map[string][]TurnEvent),
 	}
 
@@ -140,7 +141,7 @@ func TestHandleNotification_ThreadTokenUsageUpdated(t *testing.T) {
 	client := &Client{
 		logger:      slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		approvals:   make(map[string]pendingApproval),
-		turnStreams: make(map[string]chan TurnEvent),
+		turnStreams: make(map[string]*turnStream),
 		queuedTurns: make(map[string][]TurnEvent),
 	}
 
@@ -171,5 +172,90 @@ func TestHandleNotification_ThreadTokenUsageUpdated(t *testing.T) {
 	}
 	if got, want := event.TokenUsage.Last.TotalTokens, int64(5750); got != want {
 		t.Fatalf("last.totalTokens=%d, want %d", got, want)
+	}
+}
+
+func TestTurnStreamCriticalEventSurvivesBackpressure(t *testing.T) {
+	t.Parallel()
+
+	stream := newTurnStream("turn-1", slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	for i := 0; i < turnStreamPendingLimit+turnStreamBufferSize+128; i++ {
+		stream.enqueue(TurnEvent{
+			Type:  TurnEventTypeReasoningDelta,
+			Delta: "chunk",
+		}, false)
+	}
+
+	stream.enqueue(TurnEvent{
+		Type:     TurnEventTypeApprovalRequired,
+		Approval: ApprovalRequest{ApprovalID: "approval-1"},
+	}, false)
+
+	seenApproval := false
+	timeout := time.After(3 * time.Second)
+	for !seenApproval {
+		select {
+		case event, ok := <-stream.events():
+			if !ok {
+				t.Fatalf("turn stream closed before approval_required was delivered")
+			}
+			if event.Type == TurnEventTypeApprovalRequired {
+				seenApproval = true
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for queued events")
+		}
+	}
+
+	if !seenApproval {
+		t.Fatalf("approval_required event was dropped under backpressure")
+	}
+}
+
+func TestTurnStreamCoalescesHighFrequencyDeltas(t *testing.T) {
+	t.Parallel()
+
+	stream := newTurnStream("turn-1", slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	stream.enqueue(TurnEvent{
+		Type:   TurnEventTypeAgentMessageDelta,
+		ItemID: "item-1",
+		Delta:  "hello",
+	}, false)
+	stream.enqueue(TurnEvent{
+		Type:   TurnEventTypeAgentMessageDelta,
+		ItemID: "item-1",
+		Delta:  " world",
+	}, false)
+	stream.enqueue(TurnEvent{
+		Type:       TurnEventTypeCompleted,
+		StopReason: "end_turn",
+	}, true)
+
+	first := readTurnEventWithTimeout(t, stream.events())
+	if first.Type != TurnEventTypeAgentMessageDelta {
+		t.Fatalf("first event type=%q, want %q", first.Type, TurnEventTypeAgentMessageDelta)
+	}
+	if first.Delta != "hello world" {
+		t.Fatalf("delta=%q, want %q", first.Delta, "hello world")
+	}
+
+	second := readTurnEventWithTimeout(t, stream.events())
+	if second.Type != TurnEventTypeCompleted {
+		t.Fatalf("second event type=%q, want %q", second.Type, TurnEventTypeCompleted)
+	}
+}
+
+func readTurnEventWithTimeout(t *testing.T, ch <-chan TurnEvent) TurnEvent {
+	t.Helper()
+
+	select {
+	case event, ok := <-ch:
+		if !ok {
+			t.Fatalf("turn stream closed unexpectedly")
+		}
+		return event
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for turn event")
+		return TurnEvent{}
 	}
 }
