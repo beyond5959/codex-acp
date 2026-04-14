@@ -6,7 +6,27 @@
 ## 项目概览
 - 项目：acp-adapter（ACP 适配器，当前支持 Codex App Server、Claude Code CLI、Pi RPC 模式）
 - 当前阶段：Pi Adapter RPC 初版完成，Library Mode 持续收尾（R5 in progress）
-- 最近更新：2026-04-08
+- 最近更新：2026-04-14
+
+## 2026-04-14 增量修复（Codex turn stream 背压下关键事件保留）
+- 修复点：
+  - `internal/codex/client` 的每-turn 事件流不再直接把所有 notification 写进裸 `chan TurnEvent`；改为带内部 pending queue 的 `turnStream`。
+  - 在 turn 背压场景下：
+    - `completed` / `error` / `approval_required` / `backend_error` / `item_started` / `item_completed` / review mode 等关键事件不再因 channel 满而直接丢失。
+    - 高频非关键事件改为按类型降噪：
+      - `update` / `agent_message_delta` / `reasoning_delta` / `command_execution_delta` 会与同一流尾部事件合并。
+      - `token_usage_updated` / `diff_updated` / `plan_updated` 会以最新快照替换旧 pending 事件。
+      - `plan_delta` 保持逐条透传，避免破坏 fallback plan 的渐进语义。
+  - `failAll` 现在通过 stream 内部终止路径注入 `TurnEventTypeError`，不再依赖“满了就算了”的 best-effort 发送。
+- 测试与回归：
+  - 新增 `internal/codex/client_notification_test.go`
+    - `TestTurnStreamCriticalEventSurvivesBackpressure`
+    - `TestTurnStreamCoalescesHighFrequencyDeltas`
+  - 回归修正：
+    - `TestE2EACPPlanUpdateMappedFromPlanDeltaFallback`
+  - 全量通过：`go test ./...`
+- 下一步：
+  - 若仍观察到 Codex turn 背压告警，继续评估增加 turn stream backlog 观测指标（队列深度 / 合并次数 / 丢弃次数）并决定是否需要把部分 update 改成更显式的快照语义（见 KI-0055）
 
 ## 2026-04-08 增量修复（Codex permission request 标准 options + `acceptForSession`）
 - 修复点：

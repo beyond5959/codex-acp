@@ -58,6 +58,7 @@
 - KI-0052：Pi 的 archived session / native review / MCP 与 Codex 仍不对齐
 - KI-0053：Codex 高级 approval policy amendment 选项尚未完整桥接到 ACP permission UI
 - KI-0054：Pi `acceptForSession` 当前仅为 adapter-managed exact-match cache
+- KI-0055：Codex turn stream 背压已缓解，但高频非关键事件仍可能被合并或淘汰
 
 ---
 
@@ -797,3 +798,24 @@
 - 后续计划：
   - 评估为 network 审批补充 host 级 cache key、为 file 审批补充路径归一化规则。
   - 若 Pi 上游后续提供原生 remember-choice / policy API，优先切换到上游原生能力。
+
+## KI-0055：Codex turn stream 背压已缓解，但高频非关键事件仍可能被合并或淘汰
+- 现象：
+  - 2026-04-14 起，`internal/codex/client` 已不再在 turn stream 满时无差别丢事件；关键事件（如 `approval_required`、`turn/completed`）会被保留。
+  - 但为避免高频 reasoning / delta 把关键事件挤掉，adapter 现在会对非关键事件做背压降噪：
+    - 合并连续的 `update` / `agent_message_delta` / `reasoning_delta` / `command_execution_delta`
+    - 对 `token_usage_updated` / `diff_updated` / `plan_updated` 仅保留最新 pending 快照
+    - backlog 满时，旧的非关键 pending 事件仍可能被淘汰
+- 影响：
+  - turn 正确性明显好于旧实现：关键控制语义不再容易丢。
+  - 但在极端高频流式场景下，上游看到的非关键 update 粒度会变粗：
+    - reasoning/message chunk 可能从多个小块合并成一个大块
+    - token usage / diff / authoritative plan 可能只看到较新的快照，而不是每一步变化
+- 复现：
+  - 使用会持续产生大量 reasoning summary 或 command output chunk 的 Codex turn，并让 ACP client 消费速度显著低于下游通知速度。
+- Workaround：
+  - 对上游 UI 而言，应把这类 update 视为“最终一致的流式近似值”，不要依赖每个 chunk 都逐条出现。
+  - 如需更细粒度观测，可结合 `--trace-json` 检查下游原始 JSON 流，而不是只依赖桥接后的 ACP update 粒度。
+- 后续计划：
+  - 增加 turn stream 队列深度、事件合并次数、非关键淘汰次数等观测指标。
+  - 视真实运行情况决定是否把部分 update 类型进一步改造成显式 snapshot 模式或可配置策略。

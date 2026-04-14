@@ -59,6 +59,7 @@
 - ADR-0053：Pi 适配器架构（官方 RPC 模式 + session 文件恢复 + extension permission gate）
 - ADR-0054：Codex permission 桥接升级为 ACP 标准 `options/toolCall` 并支持 `acceptForSession`
 - ADR-0055：Pi `acceptForSession` 采用 adapter-managed exact-match session cache
+- ADR-0056：Codex turn stream 背压策略（关键事件保留 + 高频事件合并）
 
 ### ADR-0048：Codex `PatchChangeKind` 运行时兼容策略
 - 日期：2026-03-26
@@ -1510,4 +1511,37 @@
 - 验证方式（测试/验收项）：
   - `TestBuildSessionUpdatePayloadToolCallContent`
   - `TestE2ETurnDiffUpdatedMappedToToolCallDiffs`
+  - `go test ./...`
+
+### ADR-0056：Codex turn stream 背压策略（关键事件保留 + 高频事件合并）
+- 日期：2026-04-14
+- 状态：Accepted
+- 背景：
+  - `internal/codex/client` 之前为每个 turn 维护固定 buffer 的 `chan TurnEvent`，在满队列时直接记录 `turn stream channel full; dropping event`。
+  - 这种“无差别丢弃”会把控制类事件和普通流式事件同等处理；高频 reasoning / delta 场景下，不仅 message chunk 可能丢，`approval_required`、`turn/completed` 等关键事件也可能丢，进而破坏 ACP 可观察语义。
+- 决策：
+  - 将 per-turn 事件流改为内部 `pending queue + pump goroutine` 的 `turnStream`，对外仍保持 `<-chan TurnEvent` 契约不变。
+  - 背压时采用分层策略：
+    - 关键事件永不因满队列直接丢弃：`started`、`item_started`、`item_completed`、`approval_required`、`backend_error`、`completed`、`error`、review mode 事件。
+    - 高频非关键事件允许降噪：
+      - `update` / `agent_message_delta` / `reasoning_delta` / `command_execution_delta` 合并到同一尾部流事件。
+      - `token_usage_updated` / `diff_updated` / `plan_updated` 保留最新快照，替换旧 pending 事件。
+    - `plan_delta` 保持逐条透传，不参与合并，确保 fallback plan 的渐进更新仍可见。
+  - backlog 达到上限时，优先淘汰旧的非关键 pending 事件，而不是牺牲关键事件。
+- 备选方案：
+  - 方案A：仅调大 channel buffer。（拒绝）
+  - 方案B：继续无差别 drop，并要求用户关闭/降低 reasoning summary。（拒绝，最多只能作为缓解）
+  - 方案C：保留现有对外 channel 语义，在内部引入可降噪的背压队列。（采用）
+- 取舍（Pros/Cons）：
+  - Pros：修复关键 turn 控制事件可能被错误丢弃的问题；无需降低 reasoning summary 也能显著缓解高频事件对 turn 正确性的冲击；ACP bridge 层无需同步大改。
+  - Cons：部分高频流式文本会被合并成更大的 chunk；当前仍缺少队列深度、合并次数、淘汰次数等显式观测指标，详见 KI-0055。
+- 影响范围（文件/模块）：
+  - `internal/codex/client.go`
+  - `internal/codex/client_notification_test.go`
+  - `internal/codex/client_server_request_test.go`
+  - `test/integration/e2e_test.go`
+- 验证方式（测试/验收项）：
+  - `TestTurnStreamCriticalEventSurvivesBackpressure`
+  - `TestTurnStreamCoalescesHighFrequencyDeltas`
+  - `TestE2EACPPlanUpdateMappedFromPlanDeltaFallback`
   - `go test ./...`

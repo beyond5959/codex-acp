@@ -14,7 +14,7 @@ func TestHandleServerRequest_CommandExecutionApproval(t *testing.T) {
 	client := &Client{
 		logger:      slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		approvals:   make(map[string]pendingApproval),
-		turnStreams: make(map[string]chan TurnEvent),
+		turnStreams: make(map[string]*turnStream),
 		queuedTurns: make(map[string][]TurnEvent),
 	}
 
